@@ -1,0 +1,24 @@
+# 长江雨课堂自动刷课 + DeepSeek 智能答题
+# Python >= 3.9
+
+# HTTP 请求
+requests>=2.31.0
+
+# 环境变量配置
+python-dotenv>=1.0.0
+
+# 扫码登录（WebSocket + 二维码）
+websocket-client>=1.7.0
+qrcode>=7.4.2
+Pillow>=10.0.0
+
+# 题目字体混淆解密（雨课堂部分题目使用自定义字体加密）
+fonttools>=4.47.0
+beautifulsoup4>=4.12.0
+numpy>=1.24.0
+
+# DeepSeek / OpenAI 兼容接口
+openai>=1.30.0
+
+# 终端美化（可选，缺失时自动降级）
+rich>=13.7.0
