@@ -20,6 +20,7 @@ from .login import LoginManager
 from .richtext import DiscussionWorker, RichtextWorker
 from .session import YuketangSession
 from .video import VideoWatcher
+from . import __version__
 
 logger = get_logger("cli")
 
@@ -233,6 +234,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="yuketang",
         description="长江雨课堂自动刷课 + DeepSeek 智能答题工具",
+    )
+    parser.add_argument(
+        "-V", "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="显示版本号并退出",
     )
     parser.add_argument("--debug", action="store_true", help="开启调试日志")
     parser.add_argument("--quiet", action="store_true", help="仅输出警告与错误")

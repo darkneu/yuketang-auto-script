@@ -1,5 +1,9 @@
 # 长江雨课堂自动刷课答题脚本
 
+![version](https://img.shields.io/badge/version-1.1.0-blue)
+![python](https://img.shields.io/badge/python-3.9%2B-blue)
+![license](https://img.shields.io/badge/license-GPL--3.0-green)
+
 一个针对 **长江雨课堂**（`changjiang.yuketang.cn`）的自动化学习工具。
 
 - 🎬 **视频自动刷课**：模拟播放器心跳事件上报学习进度，无需真实播放视频
@@ -8,6 +12,8 @@
 - 📝 **作业 / 考试自动答题**：调用 DeepSeek 智能作答，支持单选、多选、判断、填空、简答
 - 🔐 **扫码登录**：自动获取并保存登录凭证
 - 🔤 **加密字体解密**：还原雨课堂自定义字体加密的题目文本
+
+> 📋 版本更新记录见 [CHANGELOG.md](CHANGELOG.md)
 
 > ⚠️ **免责声明**：本项目仅供学习与技术研究使用，请勿用于任何商业用途或违反平台规则的行为。
 > 使用本工具产生的一切后果由使用者自行承担。
