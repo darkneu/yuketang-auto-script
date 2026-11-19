@@ -2,7 +2,7 @@
 """图文（课件）与讨论区自动完成模块。
 
 - **图文**：调用 ``user_article_finish`` 接口标记已读。
-- **讨论**：调用讨论接口发帖，内容由 DeepSeek 生成。
+- **讨论**：调用讨论接口发帖，内容由所选的 DeepSeek / Codex 模式生成。
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from bs4 import BeautifulSoup
 
-from .ai import DeepSeekClient
+from .ai import AIClient
 from .config import Config
 from .course import LEAF_DISCUSSION, LEAF_RICHTEXT, Course, CourseAPI, Leaf
 from .logger import get_logger, ok, warn
@@ -98,7 +98,7 @@ class DiscussionWorker:
         self,
         session: YuketangSession,
         config: Config,
-        ai: Optional[DeepSeekClient] = None,
+        ai: Optional[AIClient] = None,
     ) -> None:
         self.session = session
         self.config = config
@@ -160,7 +160,7 @@ class DiscussionWorker:
             return True
 
         if not self.ai or not self.ai.available:
-            warn("未配置 DeepSeek，跳过讨论发帖")
+            warn(f"{self.config.ai_label} 未就绪，跳过讨论发帖，请检查对应模式配置")
             return False
 
         target = self._get_discussion_target(course, leaf, topic.get("sku_id"))

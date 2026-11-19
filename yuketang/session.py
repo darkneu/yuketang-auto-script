@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import random
 import re
-import time
+import threading
 from typing import Any, Dict, Optional
 
 import requests
@@ -52,6 +52,7 @@ class YuketangSession:
         self.user_id = str(user_id or "")
         self.max_retries = max(1, max_retries)
         self.timeout = timeout
+        self.stop_event = threading.Event()
 
         self.session = requests.Session()
         if cookies:
@@ -112,6 +113,8 @@ class YuketangSession:
         attempts = self.max_retries if retry else 1
 
         for attempt in range(1, attempts + 1):
+            if self.stop_event.is_set():
+                return None
             try:
                 resp = self.session.request(
                     method, url, headers=merged_headers, **kwargs
@@ -122,12 +125,15 @@ class YuketangSession:
                     method, url, attempt, attempts, exc,
                 )
                 if attempt < attempts:
-                    time.sleep(min(2 ** attempt, 10) + random.uniform(0, 1))
+                    self.stop_event.wait(min(2 ** attempt, 10) + random.uniform(0, 1))
                     continue
                 logger.error("请求最终失败：%s %s", method, url)
                 return None
             except requests.exceptions.RequestException as exc:
                 logger.error("请求异常：%s %s -> %s", method, url, exc)
+                return None
+
+            if self.stop_event.is_set():
                 return None
 
             # 处理雨课堂限流
@@ -136,7 +142,7 @@ class YuketangSession:
                 delay = float(match.group(1)) + 1 if match else 5.0
                 logger.warning("触发雨课堂限流，等待 %.1f 秒后重试…", delay)
                 if attempt < attempts:
-                    time.sleep(delay)
+                    self.stop_event.wait(delay)
                     continue
                 logger.error("限流重试次数耗尽：%s", url)
                 return resp
@@ -146,7 +152,7 @@ class YuketangSession:
                     "服务端错误 %d，第 %d/%d 次重试：%s",
                     resp.status_code, attempt, attempts, url,
                 )
-                time.sleep(min(2 ** attempt, 10))
+                self.stop_event.wait(min(2 ** attempt, 10))
                 continue
 
             return resp

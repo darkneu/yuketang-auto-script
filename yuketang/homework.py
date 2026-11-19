@@ -5,7 +5,7 @@
 1. 获取题目列表 ``get_exercise_list``。
 2. 解密加密字体题干。
 3. 解析题型（选择/判断/填空/简答）。
-4. 调用 DeepSeek 生成答案。
+4. 按配置调用 DeepSeek / Codex 生成答案。
 5. 提交答案 ``problem_apply``。
 
 支持作业（leaf_type=6）与考试（leaf_type=5）。
@@ -27,7 +27,7 @@ from .ai import (
     TYPE_SHORT_ANSWER,
     TYPE_SINGLE_CHOICE,
     AIError,
-    DeepSeekClient,
+    AIClient,
 )
 from .config import Config
 from .course import LEAF_EXAM, LEAF_HOMEWORK, Course, CourseAPI, Leaf
@@ -45,7 +45,7 @@ class HomeworkWorker:
         self,
         session: YuketangSession,
         config: Config,
-        ai: Optional[DeepSeekClient] = None,
+        ai: Optional[AIClient] = None,
     ) -> None:
         self.session = session
         self.config = config
@@ -186,7 +186,7 @@ class HomeworkWorker:
     def _solve(self, parsed: Dict[str, Any]) -> Optional[Any]:
         """调用 AI 生成答案。"""
         if not self.ai or not self.ai.available:
-            warn("未配置 DeepSeek，无法自动答题")
+            warn(f"{self.config.ai_label} 未就绪，无法自动答题，请检查对应模式配置")
             return None
 
         ptype = parsed["type"]

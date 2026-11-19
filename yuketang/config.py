@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -52,11 +53,20 @@ class Config:
     csrf_token: str = ""
     session_id: str = ""
 
-    # ---------- DeepSeek ----------
-    deepseek_api_key: str = ""
+    # ---------- AI 模式 ----------
+    ai_mode: str = "deepseek"
+
+    # ---------- DeepSeek（API） ----------
+    deepseek_api_key: str = field(default="", repr=False)
     deepseek_base_url: str = "https://api.deepseek.com"
-    deepseek_model: str = "deepseek-chat"
+    deepseek_model: str = "deepseek-flash"
     deepseek_temperature: float = 0.3
+    deepseek_timeout: int = 300
+
+    # ---------- Codex（复用本机登录） ----------
+    codex_cli: str = "codex"
+    codex_model: str = ""
+    codex_timeout: int = 300
 
     # ---------- 视频 ----------
     video_speed: float = 1.5
@@ -102,9 +112,33 @@ class Config:
         return bool(self.session_id)
 
     @property
+    def has_codex(self) -> bool:
+        """是否能找到 Codex CLI（登录状态由实际调用检查）。"""
+        return bool(shutil.which(self.codex_cli))
+
+    @property
     def has_deepseek(self) -> bool:
-        """是否已配置 DeepSeek。"""
+        """是否已配置 DeepSeek API Key。"""
         return bool(self.deepseek_api_key)
+
+    @property
+    def ai_label(self) -> str:
+        return {"codex": "Codex", "deepseek": "DeepSeek"}.get(self.ai_mode, self.ai_mode)
+
+    def ai_problems(self) -> list:
+        """只检查选中模式，避免要求同时配置两个后端。"""
+        if self.ai_mode == "codex":
+            return [] if self.has_codex else ["未找到 Codex CLI，请安装或设置 CODEX_CLI"]
+        if self.ai_mode == "deepseek":
+            problems = []
+            if not self.has_deepseek:
+                problems.append("DEEPSEEK_API_KEY 未配置")
+            if not self.deepseek_base_url:
+                problems.append("DEEPSEEK_BASE_URL 未配置")
+            if not self.deepseek_model:
+                problems.append("DEEPSEEK_MODEL 未配置")
+            return problems
+        return ["AI_MODE 无效，只能设置为 codex 或 deepseek"]
 
     # ------------------------------------------------------------------
     @classmethod
@@ -121,14 +155,15 @@ class Config:
             university_id=os.getenv("UNIVERSITY_ID", "").strip(),
             csrf_token=os.getenv("CSRF_TOKEN", "").strip(),
             session_id=os.getenv("SESSION_ID", "").strip(),
+            ai_mode=os.getenv("AI_MODE", "deepseek").strip().lower(),
             deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", "").strip(),
-            deepseek_base_url=os.getenv(
-                "DEEPSEEK_BASE_URL", "https://api.deepseek.com"
-            ).strip(),
-            deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip(),
-            deepseek_temperature=_as_float(
-                os.getenv("DEEPSEEK_TEMPERATURE"), 0.3
-            ),
+            deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip(),
+            deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-flash").strip(),
+            deepseek_temperature=_as_float(os.getenv("DEEPSEEK_TEMPERATURE"), 0.3),
+            deepseek_timeout=max(1, _as_int(os.getenv("DEEPSEEK_TIMEOUT"), 300)),
+            codex_cli=os.getenv("CODEX_CLI", "codex").strip() or "codex",
+            codex_model=os.getenv("CODEX_MODEL", "").strip(),
+            codex_timeout=max(1, _as_int(os.getenv("CODEX_TIMEOUT"), 300)),
             video_speed=_as_float(os.getenv("VIDEO_SPEED"), 1.5),
             heartbeat_interval=_as_int(os.getenv("HEARTBEAT_INTERVAL"), 15),
             max_concurrent_videos=_as_int(os.getenv("MAX_CONCURRENT_VIDEOS"), 2),
@@ -171,6 +206,5 @@ class Config:
             problems.append("UNIVERSITY_ID 未配置（可扫码登录后自动获取）")
         if not self.has_credentials:
             problems.append("SESSION_ID 未配置（将尝试扫码登录）")
-        if not self.has_deepseek:
-            problems.append("DEEPSEEK_API_KEY 未配置（答题功能将不可用）")
+        problems.extend(self.ai_problems())
         return problems
