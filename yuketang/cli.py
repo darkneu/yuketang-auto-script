@@ -11,7 +11,7 @@ import argparse
 import sys
 from typing import List, Optional
 
-from .ai import DeepSeekClient
+from .ai import AIError, create_ai_client
 from .config import Config
 from .course import Course, CourseAPI
 from .homework import HomeworkWorker
@@ -69,6 +69,19 @@ def _select_courses(
 # ======================================================================
 #  子命令实现
 # ======================================================================
+def cmd_ai_check(config: Config, args: argparse.Namespace) -> int:
+    """检查所选 AI 答题链路，无需雨课堂登录。"""
+    banner(f"{config.ai_label} 连接测试")
+    try:
+        ai = create_ai_client(config)
+        reply = ai.chat("只输出数字答案。", "1 + 1 等于多少？", max_retries=1)
+    except AIError as exc:
+        fail(str(exc))
+        return 1
+    ok(f"{config.ai_label} 已连接，测试回复：{reply}")
+    return 0
+
+
 def cmd_login(config: Config, args: argparse.Namespace) -> int:
     banner("扫码登录")
     session = _ensure_login(config, force_qrcode=args.qrcode)
@@ -119,10 +132,10 @@ def cmd_video(config: Config, args: argparse.Namespace) -> int:
             total[key] += stats.get(key, 0)
 
     logger.info(
-        "全部完成：成功 %d / 跳过 %d / 失败 %d（共 %d）",
+        "视频处理结束：成功 %d / 跳过 %d / 失败 %d（共 %d）",
         total["success"], total["skipped"], total["failed"], total["total"],
     )
-    return 0
+    return 1 if total["failed"] else 0
 
 
 def cmd_richtext(config: Config, args: argparse.Namespace) -> int:
@@ -152,9 +165,9 @@ def cmd_discussion(config: Config, args: argparse.Namespace) -> int:
     if not courses:
         return 1
 
-    ai = DeepSeekClient(config)
+    ai = create_ai_client(config)
     if not ai.available:
-        warn("未配置 DeepSeek，讨论内容将无法生成")
+        warn(f"{config.ai_label} 未就绪，讨论内容将无法生成，请检查对应模式配置")
     worker = DiscussionWorker(session, config, ai)
     for course in courses:
         logger.info("══ 课程：%s", course.course_name)
@@ -172,9 +185,9 @@ def cmd_homework(config: Config, args: argparse.Namespace) -> int:
     if not courses:
         return 1
 
-    ai = DeepSeekClient(config)
+    ai = create_ai_client(config)
     if not ai.available:
-        fail("未配置 DEEPSEEK_API_KEY，无法自动答题")
+        fail(f"{config.ai_label} 未就绪，无法自动答题，请检查对应模式配置")
         return 1
 
     worker = HomeworkWorker(session, config, ai)
@@ -194,7 +207,8 @@ def cmd_all(config: Config, args: argparse.Namespace) -> int:
     if not courses:
         return 1
 
-    ai = DeepSeekClient(config)
+    ai = create_ai_client(config)
+    failed_videos = 0
 
     for course in courses:
         logger.info("════════ 课程：%s ════════", course.course_name)
@@ -202,9 +216,10 @@ def cmd_all(config: Config, args: argparse.Namespace) -> int:
         # 1. 视频
         if config.auto_richtext or True:  # 视频默认开启
             step("视频刷课")
-            VideoWatcher(session, config).watch_course(
+            video_stats = VideoWatcher(session, config).watch_course(
                 course, speed=args.speed, interval=args.interval
             )
+            failed_videos += video_stats.get("failed", 0)
 
         # 2. 图文
         if config.auto_richtext:
@@ -223,6 +238,9 @@ def cmd_all(config: Config, args: argparse.Namespace) -> int:
                 course, include_exam=config.auto_exam
             )
 
+    if failed_videos:
+        fail(f"任务已结束，但仍有 {failed_videos} 个视频未确认完成，请查看日志后重试")
+        return 1
     ok("全部任务完成")
     return 0
 
@@ -233,7 +251,7 @@ def cmd_all(config: Config, args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="yuketang",
-        description="长江雨课堂自动刷课 + DeepSeek 智能答题工具",
+        description="长江雨课堂自动刷课 + DeepSeek / Codex 智能答题工具",
     )
     parser.add_argument(
         "-V", "--version",
@@ -245,6 +263,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true", help="仅输出警告与错误")
 
     sub = parser.add_subparsers(dest="command", metavar="<命令>")
+
+    p_ai = sub.add_parser("ai-check", help="测试所选 AI 模式的连接（无需雨课堂登录）")
+    p_ai.set_defaults(func=cmd_ai_check)
 
     # login
     p_login = sub.add_parser("login", help="扫码登录并保存凭证")
@@ -259,7 +280,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_video = sub.add_parser("video", help="自动刷视频")
     p_video.add_argument("-c", "--course", help="课程名称关键字过滤")
     p_video.add_argument("-s", "--speed", type=float, help="播放倍速")
-    p_video.add_argument("-i", "--interval", type=int, help="心跳间隔（秒）")
+    p_video.add_argument("-i", "--interval", type=int, help="心跳批量提交间隔（秒，至少 5 秒）")
     p_video.add_argument("-w", "--workers", type=int, help="并发数")
     p_video.add_argument("--no-skip", action="store_true", help="不跳过已完成视频")
     p_video.set_defaults(func=cmd_video)
@@ -284,7 +305,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_all = sub.add_parser("all", help="一键完成全部任务")
     p_all.add_argument("-c", "--course", help="课程名称关键字过滤")
     p_all.add_argument("-s", "--speed", type=float, help="播放倍速")
-    p_all.add_argument("-i", "--interval", type=int, help="心跳间隔（秒）")
+    p_all.add_argument("-i", "--interval", type=int, help="心跳批量提交间隔（秒，至少 5 秒）")
     p_all.set_defaults(func=cmd_all)
 
     return parser
@@ -304,7 +325,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     setup_logger(log_file=config.log_file, debug=config.debug, quiet=args.quiet)
 
     # 配置校验提示
-    problems = config.validate()
+    problems = config.validate() if args.command != "ai-check" else []
     for problem in problems:
         warn(problem)
 

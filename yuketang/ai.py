@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""DeepSeek 智能答题模块。
+"""DeepSeek / Codex 智能答题模块。
 
-基于 OpenAI 兼容接口调用 DeepSeek，支持：
+按 AI_MODE 选择 DeepSeek API 或本机已登录的 Codex CLI，支持：
 - 选择题（单选 / 多选）
 - 判断题
 - 填空题
@@ -14,8 +14,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from .config import Config
@@ -91,77 +96,26 @@ class AIError(Exception):
     """AI 调用异常。"""
 
 
-class DeepSeekClient:
-    """DeepSeek 客户端封装。"""
+class AIClient:
+    """两种后端共用的题型提示词、解析和内存缓存。"""
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self._client = None
         self._cache: Dict[str, Any] = {}
 
-    # ------------------------------------------------------------------
     @property
     def available(self) -> bool:
-        return bool(self.config.deepseek_api_key)
+        raise NotImplementedError
 
-    # ------------------------------------------------------------------
-    def _get_client(self):
-        """惰性初始化 OpenAI 客户端。"""
-        if self._client is not None:
-            return self._client
-        if not self.available:
-            raise AIError("未配置 DEEPSEEK_API_KEY，无法使用 AI 答题")
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise AIError(
-                "缺少 openai 依赖，请执行：pip install openai"
-            ) from exc
-
-        self._client = OpenAI(
-            api_key=self.config.deepseek_api_key,
-            base_url=self.config.deepseek_base_url,
-        )
-        return self._client
-
-    # ------------------------------------------------------------------
     def chat(
         self,
         system_prompt: str,
         user_prompt: str,
-        temperature: Optional[float] = None,
         max_retries: int = 3,
+        *,
+        temperature: Optional[float] = None,
     ) -> str:
-        """调用 DeepSeek 对话接口，返回清洗后的文本。"""
-        client = self._get_client()
-        temperature = (
-            self.config.deepseek_temperature if temperature is None else temperature
-        )
-
-        last_error: Optional[Exception] = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                kwargs: Dict[str, Any] = {
-                    "model": self.config.deepseek_model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "stream": False,
-                }
-                # deepseek-reasoner（推理模型）不支持 temperature 参数
-                if "reasoner" not in self.config.deepseek_model.lower():
-                    kwargs["temperature"] = temperature
-                response = client.chat.completions.create(**kwargs)
-                content = response.choices[0].message.content or ""
-                return self._strip_thinking(content)
-            except Exception as exc:  # noqa: BLE001 - 需要捕获 SDK 各类异常
-                last_error = exc
-                logger.warning("DeepSeek 调用失败（第 %d/%d 次）：%s", attempt, max_retries, exc)
-                if attempt < max_retries:
-                    time.sleep(min(2 ** attempt, 8))
-
-        raise AIError(f"DeepSeek 调用失败：{last_error}")
+        raise NotImplementedError
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -345,3 +299,226 @@ class DeepSeekClient:
         for index in range(blank_count):
             result[str(index + 1)] = parts[index] if index < len(parts) else ""
         return result
+
+
+class CodexClient(AIClient):
+    """通过非交互式 codex exec 获取答案，无需单独的 API Key。"""
+
+    # ------------------------------------------------------------------
+    @property
+    def available(self) -> bool:
+        return self.config.has_codex
+
+    # ------------------------------------------------------------------
+    def _command(self) -> List[str]:
+        """使用参数列表执行；兼容 Windows 上 npm 安装的 Codex 包。"""
+        executable = shutil.which(self.config.codex_cli)
+        if not executable:
+            raise AIError("未找到 Codex CLI，请安装或在 .env 设置 CODEX_CLI")
+        path = Path(executable)
+        if os.name == "nt" and path.suffix.lower() in {".cmd", ".bat", ".ps1"}:
+            entry = path.parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+            node = shutil.which("node")
+            if not node or not entry.is_file():
+                raise AIError("无法启动 Codex 包，请将 CODEX_CLI 设置为 codex.exe 的完整路径")
+            return [node, str(entry)]
+        return [executable]
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _stop_process(process: subprocess.Popen) -> None:
+        """停止本次调用的进程树，避免中断后留下后台答题任务。"""
+        if process.poll() is None:
+            if os.name == "nt":
+                try:
+                    subprocess.run(
+                        ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                        capture_output=True, timeout=5,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            if process.poll() is None:
+                process.kill()
+        try:
+            process.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            logger.warning("子进程输出管道尚未关闭，已停止等待")
+
+    @staticmethod
+    def _run_codex(args: List[str], *, input: str, timeout: float, **kwargs):
+        """短间隔等待输出，让 Windows 有机会及时处理 Ctrl+C。"""
+        process = subprocess.Popen(
+            args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, **kwargs,
+        )
+        deadline = time.monotonic() + timeout
+        pending_input = input
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                try:
+                    stdout, stderr = process.communicate(
+                        input=pending_input, timeout=max(0.001, min(0.2, remaining)),
+                    )
+                    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired as exc:
+                    # communicate 超时后可继续等待，但不能再次传入题目。
+                    pending_input = None
+                    if time.monotonic() >= deadline:
+                        raise subprocess.TimeoutExpired(
+                            args, timeout, output=exc.output, stderr=exc.stderr,
+                        ) from exc
+        except BaseException:
+            # KeyboardInterrupt 必须继续向外传播，不能作为 AI 失败重试。
+            CodexClient._stop_process(process)
+            raise
+
+    # ------------------------------------------------------------------
+    def chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_retries: int = 3,
+        *,
+        temperature: Optional[float] = None,
+    ) -> str:
+        """调用 Codex，读取最终回复；题目通过标准输入传入。"""
+        command = self._command()
+        prompt = (
+            "你正在作为答题助手处理文本。只返回符合下述要求的答案。"
+            "不需要操作电脑、运行命令、访问文件或调用工具。\n\n"
+            f"作答要求：\n{system_prompt}\n\n题目：\n{user_prompt}"
+        )
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                # 独立临时目录避免将项目配置、Cookie 等内容加入答题上下文。
+                with tempfile.TemporaryDirectory(prefix="yuketang_codex_") as directory:
+                    output = Path(directory) / "answer.txt"
+                    args = command + [
+                        "exec", "--skip-git-repo-check", "--ephemeral",
+                        "--sandbox", "read-only", "--color", "never",
+                        "--output-last-message", str(output),
+                    ]
+                    if self.config.codex_model:
+                        args += ["--model", self.config.codex_model]
+                    result = self._run_codex(
+                        args + ["-"], input=prompt, cwd=directory,
+                        text=True, encoding="utf-8", errors="replace",
+                        timeout=self.config.codex_timeout,
+                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                    )
+                    if result.returncode:
+                        detail = (result.stderr or result.stdout or "无错误详情").strip()[-1500:]
+                        raise AIError(
+                            f"Codex 退出码 {result.returncode}：{detail}\n"
+                            "请先执行 codex login status 检查登录，必要时执行 codex login。"
+                        )
+                    content = output.read_text(encoding="utf-8") if output.is_file() else ""
+                    cleaned = self._strip_thinking(content)
+                    if not cleaned:
+                        raise AIError("Codex 未返回答案，请检查账号额度或增大 CODEX_TIMEOUT")
+                    return cleaned
+            except subprocess.TimeoutExpired as exc:
+                detail = exc.stderr or b""
+                if isinstance(detail, bytes):
+                    detail = detail.decode("utf-8", errors="replace")
+                last_error = AIError(
+                    f"Codex 答题超时（{self.config.codex_timeout} 秒），可增大 CODEX_TIMEOUT"
+                    + (f"\n{detail.strip()[-1500:]}" if detail else "")
+                )
+            except (OSError, AIError) as exc:
+                last_error = exc
+            logger.warning("Codex 调用失败（第 %d/%d 次）：%s", attempt, max_retries, last_error)
+            if attempt < max_retries:
+                time.sleep(min(2 ** attempt, 8))
+
+        raise AIError(f"Codex 调用失败：{last_error}")
+
+
+class DeepSeekClient(AIClient):
+    """保留原项目的 OpenAI 兼容 API 调用，SDK 仅在此模式下加载。"""
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self._client = None
+
+    @property
+    def available(self) -> bool:
+        return bool(
+            self.config.has_deepseek
+            and self.config.deepseek_base_url
+            and self.config.deepseek_model
+        )
+
+    def _get_client(self):
+        if self._client is not None:
+            return self._client
+        if not self.available:
+            raise AIError("请配置 DEEPSEEK_API_KEY、DEEPSEEK_BASE_URL 和 DEEPSEEK_MODEL")
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise AIError("缺少 openai 依赖，请执行：python -m pip install -r requirements.txt") from exc
+        self._client = OpenAI(
+            api_key=self.config.deepseek_api_key,
+            base_url=self.config.deepseek_base_url,
+            timeout=self.config.deepseek_timeout,
+            max_retries=0,  # 由本模块统一重试，避免 SDK 再叠加重试。
+        )
+        return self._client
+
+    def chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_retries: int = 3,
+        *,
+        temperature: Optional[float] = None,
+    ) -> str:
+        client = self._get_client()
+        temperature = self.config.deepseek_temperature if temperature is None else temperature
+        last_error = "无错误详情"
+        for attempt in range(1, max_retries + 1):
+            try:
+                kwargs: Dict[str, Any] = {
+                    "model": self.config.deepseek_model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "stream": False,
+                }
+                # 保留原项目对旧 reasoner 接口的兼容；思考模型可忽略温度。
+                if "reasoner" not in self.config.deepseek_model.lower():
+                    kwargs["temperature"] = temperature
+                response = client.chat.completions.create(**kwargs)
+                content = self._strip_thinking(response.choices[0].message.content or "")
+                if not content:
+                    raise AIError("DeepSeek 未返回答案，请检查模型配置或增大 DEEPSEEK_TIMEOUT")
+                return content
+            except AIError as exc:
+                last_error = str(exc)
+            except Exception as exc:
+                # 不记录响应正文或 SDK 异常文本，避免其中带回密钥与认证头。
+                status = getattr(exc, "status_code", None)
+                last_error = f"{type(exc).__name__}" + (f"（HTTP {status}）" if status else "")
+                if status in (400, 401, 403, 404, 422):
+                    raise AIError(
+                        f"DeepSeek 调用失败：{last_error}，请检查密钥、接口地址和模型配置"
+                    ) from None
+            logger.warning("DeepSeek 调用失败（第 %d/%d 次）：%s", attempt, max_retries, last_error)
+            if attempt < max_retries:
+                time.sleep(min(2 ** attempt, 8))
+        raise AIError(f"DeepSeek 调用失败：{last_error}")
+
+
+def create_ai_client(config: Config) -> AIClient:
+    """只创建配置选中的后端，不自动回退到其他模式。"""
+    if config.ai_mode == "codex":
+        return CodexClient(config)
+    if config.ai_mode == "deepseek":
+        return DeepSeekClient(config)
+    raise AIError("AI_MODE 无效，只能设置为 codex 或 deepseek")

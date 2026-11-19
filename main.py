@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""长江雨课堂自动刷课 + DeepSeek 智能答题工具 —— 程序入口。
+"""长江雨课堂自动刷课 + DeepSeek / Codex 智能答题工具 —— 程序入口。
 
 用法::
 

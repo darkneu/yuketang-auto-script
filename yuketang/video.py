@@ -2,7 +2,7 @@
 """视频自动观看模块。
 
 核心原理：雨课堂通过 ``/video-log/heartbeat/`` 接口接收播放器心跳事件
-（``loadstart`` / ``play`` / ``playing`` / ``waiting`` / ``videoend`` 等），
+（``loadstart`` / ``play`` / ``playing`` / ``heartbeat`` / ``videoend`` 等），
 服务端据此累计观看时长与完成率。本模块通过构造合法的心跳序列，
 在**不真正播放视频**的情况下完成学习进度上报。
 
@@ -11,15 +11,17 @@
   ``skuid`` / ``classroomid`` / ``cc`` / ``d``(时长) 等字段。
 - 播放位置 ``cp`` 需按倍速递增，且不能超过视频总时长。
 - 需先发送 ``loadstart`` → ``loadeddata`` → ``play`` → ``playing``，
-  结束时发送 ``videoend`` → ``pause``。
+  播放中每 5 秒采样 ``heartbeat``，结束时发送 ``videoend`` → ``pause``。
+- 普通事件的 ``fp`` / ``tp`` 为 0，仅 ``seeking`` 事件填写拖动起止位置。
 """
 
 from __future__ import annotations
 
+import math
 import random
 import string
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +31,10 @@ from .logger import get_logger, ok, warn
 from .session import YuketangSession
 
 logger = get_logger("video")
+
+
+class _VideoCancelled(Exception):
+    """视频任务收到停止请求。"""
 
 
 @dataclass
@@ -65,6 +71,17 @@ class VideoWatcher:
         self.session = session
         self.config = config
         self.course_api = CourseAPI(session, config.university_id)
+        self._stop_event = session.stop_event
+
+    def _pause(self, seconds: float) -> None:
+        """分段等待，兼容主线程 Ctrl+C 与工作线程协作取消。"""
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if self._stop_event.wait(min(0.2, remaining)):
+                raise _VideoCancelled()
 
     # ==================================================================
     #  参数获取
@@ -226,7 +243,7 @@ class VideoWatcher:
 
         Returns:
             含 ``rate``（完成率 0~1）、``last_point``（最后位置秒）、
-            ``completed``（是否完成）的字典。
+            ``completed``、``intervals``（已观看区间）与 ``available`` 的字典。
         """
         url = (
             f"{self.session.base_url}/video-log/detail/"
@@ -236,19 +253,61 @@ class VideoWatcher:
         )
         headers = {"classroom-id": str(params.classroom_id), "Xt-Agent": "web"}
         data = self.session.get_json(url, headers=headers)
-        result = {"rate": 0.0, "last_point": 0.0, "completed": False}
-        if not data:
+        result = {
+            "rate": 0.0, "last_point": 0.0, "completed": False,
+            "intervals": [], "available": False,
+        }
+        if not data or data.get("success") is False or not isinstance(data.get("data"), dict):
             return result
 
         heartbeat = (data.get("data") or {}).get("heartbeat") or {}
-        if not heartbeat:
+        if not isinstance(heartbeat, dict):
             return result
-
-        rate = heartbeat.get("rate")
-        result["rate"] = float(rate) if rate is not None else 0.0
-        result["last_point"] = float(heartbeat.get("last_point") or 0.0)
-        result["completed"] = bool(heartbeat.get("completed"))
+        try:
+            rate = float(heartbeat.get("rate") or 0.0)
+            last_point = float(heartbeat.get("last_point") or 0.0)
+        except (TypeError, ValueError):
+            return result
+        if not math.isfinite(rate) or not math.isfinite(last_point):
+            return result
+        intervals = heartbeat.get("result")
+        result.update(
+            rate=max(0.0, min(rate, 1.0)),
+            last_point=max(0.0, last_point),
+            completed=str(heartbeat.get("completed", "")).lower() in {"1", "true"},
+            intervals=intervals if isinstance(intervals, list) else [],
+            available=True,
+        )
         return result
+
+    @staticmethod
+    def _is_complete(progress: Dict[str, Any]) -> bool:
+        """只把服务端完成标记或完整的观看比例作为成功。"""
+        return bool(progress.get("completed")) or progress.get("rate", 0.0) >= 1.0
+
+    @staticmethod
+    def _resume_position(params: VideoParams, progress: Dict[str, Any]) -> float:
+        """找出从开头连续覆盖区间的终点，而非最后一次上报的播放位置。"""
+        intervals = []
+        for item in progress.get("intervals", []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                start, end = float(item["s"]), float(item["e"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not math.isfinite(start) or not math.isfinite(end) or end < start:
+                continue
+            start = max(0.0, min(start, params.duration))
+            end = max(0.0, min(end, params.duration))
+            intervals.append((start, end))
+        covered = 0.0
+        for start, end in sorted(intervals):
+            if start > covered:
+                break
+            covered = max(covered, end)
+        # 区间与完成标记矛盾时重新核实整段，不能空转重复发送结束事件。
+        return covered if covered < params.duration else 0.0
 
     # ==================================================================
     #  心跳构造与发送
@@ -261,6 +320,8 @@ class VideoWatcher:
         first_position: float,
         speed: float,
         seq: int = 1,
+        *,
+        page_id: str,
     ) -> Dict[str, Any]:
         """构造单条心跳数据。"""
         return {
@@ -270,8 +331,9 @@ class VideoWatcher:
             "n": "ali-cdn.xuetangx.com",
             "lob": "cloud4",
             "cp": round(position, 2),
-            "fp": round(first_position, 2),
-            "tp": round(position, 2),
+            # fp/tp 是 seeking 的起止位置，普通播放事件必须为 0。
+            "fp": round(first_position, 2) if event == "seeking" else 0,
+            "tp": round(position, 2) if event == "seeking" else 0,
             "sp": speed,
             "ts": str(int(time.time() * 1000)),
             "u": int(params.user_id) if str(params.user_id).isdigit() else params.user_id,
@@ -282,7 +344,7 @@ class VideoWatcher:
             "classroomid": str(params.classroom_id),
             "cc": params.cc_id,
             "d": params.duration,
-            "pg": f"{params.video_id}_{self._random_suffix()}",
+            "pg": page_id,
             "sq": seq,
             "t": "video",
         }
@@ -295,6 +357,8 @@ class VideoWatcher:
     # ------------------------------------------------------------------
     def _send_heartbeat(self, data: List[Dict[str, Any]], classroom_id: Any = None) -> bool:
         """发送一批心跳数据。"""
+        if self._stop_event.is_set():
+            raise _VideoCancelled()
         url = f"{self.session.base_url}/video-log/heartbeat/"
         headers = {}
         if classroom_id is not None:
@@ -303,7 +367,10 @@ class VideoWatcher:
         if resp is None:
             return False
         # 雨课堂成功时返回空对象 {} 或 code=0 / success=true
-        if resp == {} or resp.get("code") == 0 or resp.get("success"):
+        if resp.get("success") is False:
+            logger.warning("心跳被服务端拒绝：%s", resp.get("msg") or resp.get("message") or resp.get("code"))
+            return False
+        if resp == {} or resp.get("code") == 0 or resp.get("success") is True:
             return True
         logger.debug("心跳响应异常：%s", resp)
         return False
@@ -311,137 +378,117 @@ class VideoWatcher:
     # ==================================================================
     #  观看模拟
     # ==================================================================
+    def _play_pass(
+        self, params: VideoParams, speed: float, interval: float, start_position: float,
+    ) -> bool:
+        """每 5 秒采样 heartbeat，按配置间隔批量提交；playing 仅用于开始播放。"""
+        position = start_position
+        first_position = start_position
+        page_id = f"{params.video_id}_{self._random_suffix(12)}"
+        seq = 0
+        sample_interval = 5.0
+        post_interval = max(sample_interval, float(interval))
+        pending: List[Dict[str, Any]] = []
+        last_post = time.monotonic()
+
+        def record(event: str) -> None:
+            nonlocal seq
+            seq += 1
+            payload = self._build_heartbeat(
+                params, event, position, first_position, speed, seq, page_id=page_id,
+            )
+            pending.append(payload)
+
+        def flush() -> bool:
+            nonlocal last_post
+            if not self._send_heartbeat(list(pending), classroom_id=params.classroom_id):
+                return False
+            pending.clear()
+            last_post = time.monotonic()
+            return True
+
+        for event in ("loadstart", "loadeddata", "play", "playing"):
+            record(event)
+            self._pause(0.2)
+        if not flush():
+            warn(f"视频 {params.video_id} 启动心跳失败，停止本轮播放")
+            return False
+
+        step = sample_interval * speed
+        while position < params.duration:
+            advance = min(step, params.duration - position)
+            self._pause(advance / speed)
+            position = min(position + advance, params.duration)
+            record("heartbeat")
+            if time.monotonic() - last_post >= post_interval or position >= params.duration:
+                if not flush():
+                    warn(f"视频 {params.video_id} 心跳失败（位置 {position:.0f}s），停止本轮播放")
+                    return False
+            if seq % 6 == 0 or position >= params.duration:
+                logger.info(
+                    "视频 %s 上报播放位置 %.1f%% (%.0f/%.0fs)，完成状态待服务端校验",
+                    params.video_id, position / params.duration * 100,
+                    position, params.duration,
+                )
+
+        for event in ("videoend", "pause"):
+            record(event)
+            self._pause(0.2)
+        return flush()
+
     def watch(
         self,
         params: VideoParams,
         speed: Optional[float] = None,
         interval: Optional[int] = None,
         start_position: float = 0.0,
+        initial_progress: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """模拟完整观看一个视频。
+        """播放并核实服务端覆盖率；只有确认完成才返回 True。"""
+        speed = self.config.video_speed if speed is None else speed
+        interval = self.config.heartbeat_interval if interval is None else interval
+        if not math.isfinite(speed) or not math.isfinite(interval) or speed <= 0 or interval <= 0:
+            raise ValueError("视频倍速和心跳间隔必须大于 0")
+        progress = initial_progress if initial_progress is not None else self.get_progress(params)
+        start = max(0.0, min(start_position, params.duration))
+        if start >= params.duration:
+            start = self._resume_position(params, progress)
 
-        Args:
-            params: 视频参数。
-            speed: 播放倍速，默认取配置值。
-            interval: 心跳间隔（秒），默认取配置值。
-            start_position: 起始播放位置（秒），用于断点续看。
-        """
-        speed = speed or self.config.video_speed
-        interval = interval or self.config.heartbeat_interval
-        duration = params.duration
-
-        if start_position >= duration:
-            start_position = 0.0
-
-        logger.info(
-            "开始观看视频 id=%s 时长=%.0fs 倍速=%.1fx 起点=%.0fs",
-            params.video_id, duration, speed, start_position,
-        )
-
-        position = start_position
-        first_position = start_position
-        seq = 1
-
-        # 每次心跳前进的秒数。
-        # 服务端会校验「两次心跳的真实时间间隔」与「cp 增量」是否匹配：
-        # 真实经过 interval 秒，最多只认可 interval * speed 秒的进度。
-        # 因此 step 必须 <= interval * speed，并留出安全余量（网络延迟、
-        # 心跳发送耗时都会让真实间隔略大于 interval，若 step 取满会超速被丢弃）。
-        # 这里取 0.9 的安全系数，避免因超速导致完成率不足。
-        step = max(interval * speed * 0.9, 1.0)
-
-        logger.debug(
-            "心跳步长 step=%.2fs（interval=%ss × speed=%.1fx × 0.9）",
-            step, interval, speed,
-        )
-
-        # ---- 起始事件序列 ----
-        for event in ("loadstart", "loadeddata", "play", "playing"):
-            self._send_heartbeat(
-                [self._build_heartbeat(params, event, position, first_position, speed, seq)],
-                classroom_id=params.classroom_id,
-            )
-            seq += 1
-            time.sleep(0.2)
-
-        # ---- 播放过程心跳 ----
-        while position < duration:
-            position = min(position + step, duration)
-
-            # 大部分时间为 playing，偶尔插入 waiting 更贴近真实
-            event = random.choices(
-                ["playing", "waiting"], weights=[0.9, 0.1], k=1
-            )[0]
-
-            success = self._send_heartbeat(
-                [self._build_heartbeat(params, event, position, first_position, speed, seq)],
-                classroom_id=params.classroom_id,
-            )
-            seq += 1
-
-            if not success:
-                warn(f"心跳发送失败（位置 {position:.0f}s），继续尝试…")
-
-            if seq % 6 == 0:
-                logger.info(
-                    "  进度 %.1f%% (%.0f/%.0fs)",
-                    position / duration * 100, position, duration,
-                )
-
-            # 节流：避免触发服务端限流
-            time.sleep(interval)
-
-        # ---- 结束事件序列 ----
-        for event in ("videoend", "pause"):
-            self._send_heartbeat(
-                [self._build_heartbeat(params, event, duration, first_position, speed, seq)],
-                classroom_id=params.classroom_id,
-            )
-            seq += 1
-            time.sleep(0.2)
-
-        # ---- 校验结果，不足则补发心跳 ----
-        time.sleep(1)
-        progress = self.get_progress(params)
-        rate = progress.get("rate", 0.0)
-
-        # 若完成率不足，说明部分心跳被服务端按超速丢弃，
-        # 此时以「服务端认可的进度」为基准，按安全步长补发心跳直至达标。
-        retry_round = 0
-        while rate < 0.9 and retry_round < 5:
-            retry_round += 1
-            server_point = progress.get("last_point", 0.0)
-            # 从服务端认可的位置继续，避免重复上报已认可区间
-            position = min(server_point, duration)
+        for attempt in range(1, 4):
             logger.info(
-                "完成率 %.1f%% 不足，第 %d 轮补发心跳（从 %.0fs 继续）",
-                rate * 100, retry_round, position,
+                "开始观看视频 id=%s 时长=%.0fs 倍速=%.1fx 起点=%.0fs（第 %d/3 轮）",
+                params.video_id, params.duration, speed, start, attempt,
             )
-            while position < duration:
-                position = min(position + step, duration)
-                self._send_heartbeat(
-                    [self._build_heartbeat(params, "playing", position, first_position, speed, seq)],
-                    classroom_id=params.classroom_id,
-                )
-                seq += 1
-                time.sleep(interval)
-            # 补发结束事件
-            for event in ("videoend", "pause"):
-                self._send_heartbeat(
-                    [self._build_heartbeat(params, event, duration, first_position, speed, seq)],
-                    classroom_id=params.classroom_id,
-                )
-                seq += 1
-                time.sleep(0.2)
-            time.sleep(1)
-            progress = self.get_progress(params)
-            rate = progress.get("rate", 0.0)
+            previous_rate = progress.get("rate", 0.0)
+            sent = self._play_pass(params, speed, interval, start)
 
-        if rate >= 0.9:
-            ok(f"视频 {params.video_id} 观看完成，完成率 {rate:.1%}")
-            return True
-        warn(f"视频 {params.video_id} 完成率仅 {rate:.1%}，可能需重试")
-        return rate > 0
+            # 进度写入可能稍有延迟，只查询确认，不空转补发 videoend。
+            for check in range(3):
+                self._pause(1 if check == 0 else 2)
+                progress = self.get_progress(params)
+                if self._is_complete(progress):
+                    ok(f"视频 {params.video_id} 服务端确认完成，完成率 {progress['rate']:.1%}")
+                    return True
+
+            if not progress.get("available"):
+                warn(f"视频 {params.video_id} 无法读取服务端进度，本次不计为完成")
+                return False
+            rate = progress["rate"]
+            next_start = self._resume_position(params, progress)
+            logger.warning(
+                "视频 %s 服务端完成率 %.1f%%，最后上报位置 %.0fs，首个未覆盖位置 %.0fs",
+                params.video_id, rate * 100, progress["last_point"], next_start,
+            )
+            if not sent:
+                warn(f"视频 {params.video_id} 心跳提交失败，请检查连接后重试")
+                return False
+            if rate <= previous_rate + 0.000001:
+                warn(f"视频 {params.video_id} 本轮未增加有效观看进度，停止自动重放，本次计为失败")
+                return False
+            start = next_start
+
+        warn(f"视频 {params.video_id} 三轮后仍未完成（{progress['rate']:.1%}），本次计为失败")
+        return False
 
     # ==================================================================
     #  批量刷课
@@ -482,7 +529,9 @@ class VideoWatcher:
                 logger.info("── [%d/%d] %s", index, len(leaves), leaf.name)
                 self._watch_one(course, leaf, speed, interval, skip_completed, stats)
         else:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor = ThreadPoolExecutor(max_workers=max_workers)
+            futures = {}
+            try:
                 futures = {
                     executor.submit(
                         self._watch_one,
@@ -490,17 +539,28 @@ class VideoWatcher:
                     ): leaf
                     for leaf in leaves
                 }
-                for future in as_completed(futures):
-                    leaf = futures[future]
-                    try:
-                        status = future.result()
-                    except Exception as exc:  # pragma: no cover
-                        logger.error("视频 %s 处理异常：%s", leaf.name, exc)
-                        status = "failed"
-                    stats[status] = stats.get(status, 0) + 1
+                pending = set(futures)
+                while pending:
+                    done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        leaf = futures[future]
+                        try:
+                            status = future.result()
+                        except Exception as exc:  # pragma: no cover
+                            logger.error("视频 %s 处理异常：%s", leaf.name, exc)
+                            status = "failed"
+                        stats[status] = stats.get(status, 0) + 1
+            except KeyboardInterrupt:
+                self._stop_event.set()
+                for future in futures:
+                    future.cancel()
+                warn("正在停止视频任务；已发出的网络请求需等待返回或超时…")
+                raise
+            finally:
+                executor.shutdown(wait=True)
 
         logger.info(
-            "课程《%s》完成：成功 %d / 跳过 %d / 失败 %d（共 %d）",
+            "课程《%s》处理结束：成功 %d / 跳过 %d / 失败 %d（共 %d）",
             course.course_name,
             stats["success"], stats["skipped"], stats["failed"], stats["total"],
         )
@@ -517,32 +577,37 @@ class VideoWatcher:
         stats: Optional[Dict[str, int]],
     ) -> str:
         """处理单个视频，返回状态字符串。"""
+        if self._stop_event.is_set():
+            return "skipped"
         params = self.build_params(course, leaf)
         if not params:
             if stats is not None:
                 stats["failed"] += 1
             return "failed"
 
+        progress = self.get_progress(params)
+        if not progress.get("available"):
+            warn(f"无法读取视频 {params.video_id} 的服务端进度，跳过本次播放并计为失败")
+            if stats is not None:
+                stats["failed"] += 1
+            return "failed"
         if skip_completed:
-            progress = self.get_progress(params)
-            if progress.get("rate", 0) >= 0.9:
+            if self._is_complete(progress):
                 logger.info("⏭️  已完成（%.1f%%），跳过：%s", progress["rate"] * 100, leaf.name)
                 if stats is not None:
                     stats["skipped"] += 1
                 return "skipped"
 
-        # 断点续看：从服务端认可的位置继续，避免重复上报已认可区间。
-        # 注意不要回退（如 last_point - 10），否则会与已认可区间重叠，
-        # 服务端可能因位置回退而拒绝后续心跳。
-        start = 0.0
-        if skip_completed:
-            progress = self.get_progress(params)
-            last_point = progress.get("last_point", 0.0)
-            if last_point > 0:
-                start = min(last_point, params.duration)
+        # last_point 只是播放头位置，可能已在结尾，但中间存在大量未观看区间。
+        start = self._resume_position(params, progress) if skip_completed else 0.0
 
         try:
-            success = self.watch(params, speed=speed, interval=interval, start_position=start)
+            success = self.watch(
+                params, speed=speed, interval=interval,
+                start_position=start, initial_progress=progress,
+            )
+        except _VideoCancelled:
+            return "skipped"
         except Exception as exc:
             logger.error("视频 %s 观看异常：%s", leaf.name, exc)
             success = False
