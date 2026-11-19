@@ -16,6 +16,7 @@ dist/
 
 # 虚拟环境
 .venv/
+.build_tmp/
 venv/
 env/
 ENV/
@@ -42,3 +43,4 @@ data/font_mapping.json
 .vscode/
 *.swp
 .DS_Store
+/tests/
