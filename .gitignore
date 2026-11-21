@@ -35,6 +35,7 @@ logs/
 # 字体解密缓存（首次运行自动下载生成）
 data/font_cache/
 data/font_mapping.json
+task-state/
 
 # ============================================================
 #  编辑器 / 系统
@@ -43,4 +44,3 @@ data/font_mapping.json
 .vscode/
 *.swp
 .DS_Store
-/tests/

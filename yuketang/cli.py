@@ -34,7 +34,7 @@ def _build_session(config: Config) -> YuketangSession:
     return YuketangSession(
         domain=config.domain,
         cookies=cookies,
-        university_id=config.university_id,
+        university_id=config.effective_university_id,
         csrf_token=config.csrf_token,
         max_retries=config.max_retries,
         user_id=config.user_id,
@@ -96,7 +96,7 @@ def cmd_courses(config: Config, args: argparse.Namespace) -> int:
     session = _ensure_login(config)
     if session is None:
         return 1
-    api = CourseAPI(session, config.university_id)
+    api = CourseAPI(session, config.effective_university_id)
     courses = api.list_courses()
     if not courses:
         warn("没有进行中的课程")
@@ -112,7 +112,7 @@ def cmd_video(config: Config, args: argparse.Namespace) -> int:
     session = _ensure_login(config)
     if session is None:
         return 1
-    api = CourseAPI(session, config.university_id)
+    api = CourseAPI(session, config.effective_university_id)
     courses = _select_courses(api, config, args.course)
     if not courses:
         return 1
@@ -143,7 +143,7 @@ def cmd_richtext(config: Config, args: argparse.Namespace) -> int:
     session = _ensure_login(config)
     if session is None:
         return 1
-    api = CourseAPI(session, config.university_id)
+    api = CourseAPI(session, config.effective_university_id)
     courses = _select_courses(api, config, args.course)
     if not courses:
         return 1
@@ -160,7 +160,7 @@ def cmd_discussion(config: Config, args: argparse.Namespace) -> int:
     session = _ensure_login(config)
     if session is None:
         return 1
-    api = CourseAPI(session, config.university_id)
+    api = CourseAPI(session, config.effective_university_id)
     courses = _select_courses(api, config, args.course)
     if not courses:
         return 1
@@ -180,7 +180,7 @@ def cmd_homework(config: Config, args: argparse.Namespace) -> int:
     session = _ensure_login(config)
     if session is None:
         return 1
-    api = CourseAPI(session, config.university_id)
+    api = CourseAPI(session, config.effective_university_id)
     courses = _select_courses(api, config, args.course)
     if not courses:
         return 1
@@ -202,7 +202,7 @@ def cmd_all(config: Config, args: argparse.Namespace) -> int:
     session = _ensure_login(config)
     if session is None:
         return 1
-    api = CourseAPI(session, config.university_id)
+    api = CourseAPI(session, config.effective_university_id)
     courses = _select_courses(api, config, args.course)
     if not courses:
         return 1
@@ -214,7 +214,7 @@ def cmd_all(config: Config, args: argparse.Namespace) -> int:
         logger.info("════════ 课程：%s ════════", course.course_name)
 
         # 1. 视频
-        if config.auto_richtext or True:  # 视频默认开启
+        if config.auto_video:  # 视频默认开启
             step("视频刷课")
             video_stats = VideoWatcher(session, config).watch_course(
                 course, speed=args.speed, interval=args.interval

@@ -27,7 +27,7 @@ class RichtextWorker:
     def __init__(self, session: YuketangSession, config: Config) -> None:
         self.session = session
         self.config = config
-        self.course_api = CourseAPI(session, config.university_id)
+        self.course_api = CourseAPI(session, config.effective_university_id)
 
     # ------------------------------------------------------------------
     def finish_one(self, course: Course, leaf: Leaf, stay_seconds: Optional[int] = None) -> bool:
@@ -47,17 +47,22 @@ class RichtextWorker:
 
         # 已读则跳过
         status = self.session.get_json(status_url, headers=headers)
+        if status and status.get("success") and "finish" in (status.get("data") or {}):
+            self.session.emit(leaf.leaf_id, finish=(status.get("data") or {})["finish"])
         if status and status.get("success"):
             if (status.get("data") or {}).get("finish") == 1:
                 logger.info("⏭️  图文已完成，跳过：%s", leaf.name)
                 return True
 
         if stay_seconds > 0:
+            self.session.emit(leaf.leaf_id, stage="阅读中")
             logger.debug("模拟阅读停留 %d 秒…", stay_seconds)
-            time.sleep(stay_seconds)
+            if self.session.stop_event.wait(stay_seconds):
+                return False
 
         result = self.session.get_json(finish_url, headers=headers)
         if result and result.get("success"):
+            self.session.emit(leaf.leaf_id, stage="已处理")
             ok(f"图文打卡完成：{leaf.name}")
             return True
         warn(f"图文打卡失败：{leaf.name} -> {result}")
@@ -77,6 +82,8 @@ class RichtextWorker:
         logger.info("课程《%s》共 %d 篇图文", course.course_name, len(leaves))
         stats = {"total": len(leaves), "success": 0, "failed": 0}
         for index, leaf in enumerate(leaves, 1):
+            if self.session.stop_event.is_set():
+                break
             logger.info("── [%d/%d] %s", index, len(leaves), leaf.name)
             if self.finish_one(course, leaf):
                 stats["success"] += 1
@@ -103,7 +110,7 @@ class DiscussionWorker:
         self.session = session
         self.config = config
         self.ai = ai
-        self.course_api = CourseAPI(session, config.university_id)
+        self.course_api = CourseAPI(session, config.effective_university_id)
 
     # ------------------------------------------------------------------
     def _get_topic(self, course: Course, leaf: Leaf) -> Optional[Dict[str, Any]]:
@@ -151,6 +158,8 @@ class DiscussionWorker:
     def post_one(self, course: Course, leaf: Leaf) -> bool:
         """完成单个讨论发帖。"""
         topic = self._get_topic(course, leaf)
+        if topic:
+            self.session.emit(leaf.leaf_id, content=topic.get("text", ""), finish=topic.get("finish"))
         if not topic:
             warn(f"无法获取讨论内容：{leaf.name}")
             return False
@@ -158,6 +167,8 @@ class DiscussionWorker:
         if topic.get("finish"):
             logger.info("⏭️  讨论已完成，跳过：%s", leaf.name)
             return True
+
+        self.session.emit(leaf.leaf_id, stage="生成答案中")
 
         if not self.ai or not self.ai.available:
             warn(f"{self.config.ai_label} 未就绪，跳过讨论发帖，请检查对应模式配置")
@@ -169,6 +180,9 @@ class DiscussionWorker:
             return False
 
         answer = self.ai.answer_discussion(topic["text"])
+        if self.session.stop_event.is_set():
+            return False
+        self.session.emit(leaf.leaf_id, answer=answer, answer_state="待发布", stage="发布中")
         logger.info("AI 生成讨论内容（%d 字）", len(answer))
 
         payload = {
@@ -183,13 +197,15 @@ class DiscussionWorker:
         }
         url = (
             f"{self.session.base_url}/v/discussion/v2/comment/"
-            f"?term=latest&uv_id={self.config.university_id}"
+            f"?term=latest&uv_id={self.config.effective_university_id}"
         )
         result = self.session.post_json(url, payload=payload)
         if result and result.get("success"):
+            self.session.emit(leaf.leaf_id, answer=answer, answer_state="已发布")
             ok(f"讨论发帖成功：{leaf.name}")
             return True
         warn(f"讨论发帖失败：{leaf.name} -> {result}")
+        self.session.emit(leaf.leaf_id, answer=answer, answer_state="发布失败")
         return False
 
     # ------------------------------------------------------------------
@@ -206,6 +222,8 @@ class DiscussionWorker:
         logger.info("课程《%s》共 %d 个讨论", course.course_name, len(leaves))
         stats = {"total": len(leaves), "success": 0, "failed": 0}
         for index, leaf in enumerate(leaves, 1):
+            if self.session.stop_event.is_set():
+                break
             logger.info("── [%d/%d] %s", index, len(leaves), leaf.name)
             if self.post_one(course, leaf):
                 stats["success"] += 1

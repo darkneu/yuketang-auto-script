@@ -49,6 +49,7 @@ class VideoParams:
     cc_id: str
     duration: float
     university_id: str = ""
+    initial_progress: Optional[Dict[str, Any]] = None
 
     def is_valid(self) -> bool:
         return all(
@@ -70,7 +71,7 @@ class VideoWatcher:
     def __init__(self, session: YuketangSession, config: Config) -> None:
         self.session = session
         self.config = config
-        self.course_api = CourseAPI(session, config.university_id)
+        self.course_api = CourseAPI(session, config.effective_university_id)
         self._stop_event = session.stop_event
 
     def _pause(self, seconds: float) -> None:
@@ -107,8 +108,6 @@ class VideoWatcher:
             or ""
         )
 
-        duration = self._resolve_duration(media, cc_id)
-
         params = VideoParams(
             user_id=user_id,
             course_id=course_id,
@@ -116,8 +115,8 @@ class VideoWatcher:
             sku_id=sku_id,
             classroom_id=course.classroom_id,
             cc_id=cc_id,
-            duration=duration,
-            university_id=self.config.university_id,
+            duration=0,
+            university_id=self.config.effective_university_id,
         )
 
         # 关键：以服务端进度接口返回的 video_length 为准。
@@ -125,16 +124,12 @@ class VideoWatcher:
         # 而服务端按 video_length 计算完成率，若客户端时长偏小会导致
         # 「播放到终点但完成率不足」。
         server_length = self._server_video_length(params)
-        if server_length > 0 and abs(server_length - params.duration) > 1:
-            logger.info(
-                "校正视频时长：本地 %.0fs → 服务端 %.0fs",
-                params.duration, server_length,
-            )
-            params.duration = server_length
+        params.duration = server_length if server_length > 0 else self._resolve_duration(media, cc_id)
 
         if not params.is_valid():
             logger.debug("视频参数不完整：%s", params)
             return None
+        self.session.emit(leaf.leaf_id, duration=params.duration)
         return params
 
     # ------------------------------------------------------------------
@@ -148,6 +143,7 @@ class VideoWatcher:
         )
         headers = {"classroom-id": str(params.classroom_id), "Xt-Agent": "web"}
         data = self.session.get_json(url, headers=headers)
+        params.initial_progress = self._parse_progress(params, data)
         if not data:
             return 0.0
         heartbeat = (data.get("data") or {}).get("heartbeat") or {}
@@ -253,6 +249,9 @@ class VideoWatcher:
         )
         headers = {"classroom-id": str(params.classroom_id), "Xt-Agent": "web"}
         data = self.session.get_json(url, headers=headers)
+        return self._parse_progress(params, data)
+
+    def _parse_progress(self, params: VideoParams, data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         result = {
             "rate": 0.0, "last_point": 0.0, "completed": False,
             "intervals": [], "available": False,
@@ -278,6 +277,9 @@ class VideoWatcher:
             intervals=intervals if isinstance(intervals, list) else [],
             available=True,
         )
+        self.session.emit(params.video_id,
+                          server_rate=result["rate"] if "rate" in heartbeat else None,
+                          server_completed=(self._is_complete(result) if "rate" in heartbeat or "completed" in heartbeat else None))
         return result
 
     @staticmethod
@@ -324,6 +326,7 @@ class VideoWatcher:
         page_id: str,
     ) -> Dict[str, Any]:
         """构造单条心跳数据。"""
+        self.session.emit(params.video_id, position=position, duration=params.duration)
         return {
             "i": 5,
             "et": event,
@@ -585,7 +588,8 @@ class VideoWatcher:
                 stats["failed"] += 1
             return "failed"
 
-        progress = self.get_progress(params)
+        progress = params.initial_progress if params.initial_progress is not None else self.get_progress(params)
+        params.initial_progress = None
         if not progress.get("available"):
             warn(f"无法读取视频 {params.video_id} 的服务端进度，跳过本次播放并计为失败")
             if stats is not None:

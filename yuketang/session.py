@@ -53,6 +53,7 @@ class YuketangSession:
         self.max_retries = max(1, max_retries)
         self.timeout = timeout
         self.stop_event = threading.Event()
+        self.observer = None  # Optional local UI callback; never receives cookies or headers.
 
         self.session = requests.Session()
         if cookies:
@@ -74,6 +75,10 @@ class YuketangSession:
         }
 
     # ------------------------------------------------------------------
+    def emit(self, leaf_id: int, **values: Any) -> None:
+        if self.observer is not None:
+            self.observer(leaf_id, values)
+
     def update_headers(self, **kwargs: Any) -> None:
         """批量更新请求头。"""
         for key, value in kwargs.items():

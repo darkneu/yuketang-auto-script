@@ -6,6 +6,8 @@
 
 一个针对 **长江雨课堂**（`changjiang.yuketang.cn`）的自动化学习工具。
 
+**原生桌面版：** Windows 软件入口为 `desktop.py`，启动与打包方法见 [桌面版说明](DESKTOP.md)。现有命令行入口保持可用。
+
 - 🎬 **视频自动刷课**：模拟播放器心跳事件上报学习进度，无需真实播放视频
 - 📖 **图文自动打卡**：自动标记课件为已读
 - 💬 **讨论区自动发帖**：按配置调用 DeepSeek API 或 Codex 生成讨论内容并自动发布
@@ -135,7 +137,7 @@ python main.py login
 
 终端出现「扫码登录成功」后，凭证会保存到 `.env`，之后执行其他命令会自动复用；凭证失效时会重新扫码。需要主动重新扫码时运行 `python main.py login --qrcode`。
 
-若提示无法获取 `university_id`，先按上文说明从浏览器 Cookie 获取学校 ID，填写到 `.env` 的 `UNIVERSITY_ID` 后重试。
+扫码前需要按上文说明从浏览器 Cookie 获取学校 ID，填写到 `.env` 的 `UNIVERSITY_ID`（或桌面端「设置 → 连接 → 学校 ID」）后再登录。扫码不会自动获取学校 ID。
 
 > 也可以手动把浏览器的 `csrftoken` / `sessionid` 填到 `.env`，然后运行 `python main.py login` 验证。
 
