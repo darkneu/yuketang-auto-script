@@ -57,6 +57,7 @@ class Leaf:
     sku_id: int = 0
     leafinfo_id: int = 0
     raw: Dict[str, Any] = field(default_factory=dict)
+    chapter_id: int = 0
 
     @property
     def type_name(self) -> str:
@@ -151,12 +152,12 @@ class CourseAPI:
                 nested = section.get("leaf_list")
                 if nested:
                     for leaf in nested:
-                        parsed = self._parse_leaf(leaf, chapter_name, section)
+                        parsed = self._parse_leaf(leaf, chapter_name, section, chapter.get("id", 0))
                         if parsed:
                             leaves.append(parsed)
                 else:
                     # 情况二：section 本身即为叶子节点
-                    parsed = self._parse_leaf(section, chapter_name, section)
+                    parsed = self._parse_leaf(section, chapter_name, section, chapter.get("id", 0))
                     if parsed:
                         leaves.append(parsed)
 
@@ -175,6 +176,7 @@ class CourseAPI:
         leaf: Dict[str, Any],
         chapter_name: str,
         section: Dict[str, Any],
+        chapter_id: int = 0,
     ) -> Optional[Leaf]:
         """将原始 leaf 字典解析为 ``Leaf`` 对象。"""
         leaf_id = leaf.get("id")
@@ -200,6 +202,7 @@ class CourseAPI:
             sku_id=int(leaf.get("sku_id") or section.get("sku_id") or 0),
             leafinfo_id=int(leaf.get("leafinfo_id") or 0),
             raw=leaf,
+            chapter_id=int(chapter_id or 0),
         )
 
     # ------------------------------------------------------------------

@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -102,6 +103,27 @@ class AIClient:
     def __init__(self, config: Config) -> None:
         self.config = config
         self._cache: Dict[str, Any] = {}
+        self.stop_event = None
+        self.reply_observer = None
+
+    def _report_reply(self, backend, model, question, reply):
+        if self.reply_observer is not None:
+            try:
+                self.reply_observer({"time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                                     "backend": backend, "model": model,
+                                     "question": question, "reply": reply})
+            except Exception:
+                logger.warning("AI 回复日志记录失败")
+
+    def _check_cancelled(self):
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise AIError("任务已停止")
+
+    def _retry_pause(self, seconds):
+        if self.stop_event is None:
+            time.sleep(seconds)
+        elif self.stop_event.wait(seconds):
+            raise AIError("任务已停止")
 
     @property
     def available(self) -> bool:
@@ -346,7 +368,7 @@ class CodexClient(AIClient):
             logger.warning("子进程输出管道尚未关闭，已停止等待")
 
     @staticmethod
-    def _run_codex(args: List[str], *, input: str, timeout: float, **kwargs):
+    def _run_codex(args: List[str], *, input: str, timeout: float, stop_event=None, **kwargs):
         """短间隔等待输出，让 Windows 有机会及时处理 Ctrl+C。"""
         process = subprocess.Popen(
             args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -356,6 +378,8 @@ class CodexClient(AIClient):
         pending_input = input
         try:
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    raise AIError("任务已停止")
                 remaining = deadline - time.monotonic()
                 try:
                     stdout, stderr = process.communicate(
@@ -393,6 +417,7 @@ class CodexClient(AIClient):
 
         last_error: Optional[Exception] = None
         for attempt in range(1, max_retries + 1):
+            self._check_cancelled()
             try:
                 # 独立临时目录避免将项目配置、Cookie 等内容加入答题上下文。
                 with tempfile.TemporaryDirectory(prefix="yuketang_codex_") as directory:
@@ -408,32 +433,30 @@ class CodexClient(AIClient):
                         args + ["-"], input=prompt, cwd=directory,
                         text=True, encoding="utf-8", errors="replace",
                         timeout=self.config.codex_timeout,
+                        stop_event=self.stop_event,
                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                     )
                     if result.returncode:
-                        detail = (result.stderr or result.stdout or "无错误详情").strip()[-1500:]
                         raise AIError(
-                            f"Codex 退出码 {result.returncode}：{detail}\n"
+                            f"Codex 退出码 {result.returncode}\n"
                             "请先执行 codex login status 检查登录，必要时执行 codex login。"
                         )
                     content = output.read_text(encoding="utf-8") if output.is_file() else ""
+                    self._report_reply("codex", self.config.codex_model or "CLI 默认模型", user_prompt, content)
                     cleaned = self._strip_thinking(content)
                     if not cleaned:
                         raise AIError("Codex 未返回答案，请检查账号额度或增大 CODEX_TIMEOUT")
                     return cleaned
             except subprocess.TimeoutExpired as exc:
-                detail = exc.stderr or b""
-                if isinstance(detail, bytes):
-                    detail = detail.decode("utf-8", errors="replace")
                 last_error = AIError(
                     f"Codex 答题超时（{self.config.codex_timeout} 秒），可增大 CODEX_TIMEOUT"
-                    + (f"\n{detail.strip()[-1500:]}" if detail else "")
                 )
             except (OSError, AIError) as exc:
                 last_error = exc
+            self._check_cancelled()
             logger.warning("Codex 调用失败（第 %d/%d 次）：%s", attempt, max_retries, last_error)
             if attempt < max_retries:
-                time.sleep(min(2 ** attempt, 8))
+                self._retry_pause(min(2 ** attempt, 8))
 
         raise AIError(f"Codex 调用失败：{last_error}")
 
@@ -478,10 +501,12 @@ class DeepSeekClient(AIClient):
         *,
         temperature: Optional[float] = None,
     ) -> str:
+        self._check_cancelled()
         client = self._get_client()
         temperature = self.config.deepseek_temperature if temperature is None else temperature
         last_error = "无错误详情"
         for attempt in range(1, max_retries + 1):
+            self._check_cancelled()
             try:
                 kwargs: Dict[str, Any] = {
                     "model": self.config.deepseek_model,
@@ -495,9 +520,12 @@ class DeepSeekClient(AIClient):
                 if "reasoner" not in self.config.deepseek_model.lower():
                     kwargs["temperature"] = temperature
                 response = client.chat.completions.create(**kwargs)
-                content = self._strip_thinking(response.choices[0].message.content or "")
+                raw = response.choices[0].message.content or ""
+                self._report_reply("deepseek", self.config.deepseek_model, user_prompt, raw)
+                content = self._strip_thinking(raw)
                 if not content:
                     raise AIError("DeepSeek 未返回答案，请检查模型配置或增大 DEEPSEEK_TIMEOUT")
+                self._check_cancelled()
                 return content
             except AIError as exc:
                 last_error = str(exc)
@@ -509,9 +537,10 @@ class DeepSeekClient(AIClient):
                     raise AIError(
                         f"DeepSeek 调用失败：{last_error}，请检查密钥、接口地址和模型配置"
                     ) from None
+            self._check_cancelled()
             logger.warning("DeepSeek 调用失败（第 %d/%d 次）：%s", attempt, max_retries, last_error)
             if attempt < max_retries:
-                time.sleep(min(2 ** attempt, 8))
+                self._retry_pause(min(2 ** attempt, 8))
         raise AIError(f"DeepSeek 调用失败：{last_error}")
 
 

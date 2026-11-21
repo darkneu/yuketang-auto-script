@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -18,7 +19,8 @@ except ImportError:  # pragma: no cover - 依赖缺失时降级
     def load_dotenv(*_args, **_kwargs):  # type: ignore
         return False
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = (Path(sys.executable).resolve().parent / "data" if getattr(sys, "frozen", False)
+                else Path(__file__).resolve().parent.parent)
 
 
 def _as_bool(value: Optional[str], default: bool = False) -> bool:
@@ -52,6 +54,8 @@ class Config:
     # ---------- 登录凭证 ----------
     csrf_token: str = ""
     session_id: str = ""
+    # School bound to the saved login, separate from the editable school input.
+    session_university_id: str = ""
 
     # ---------- AI 模式 ----------
     ai_mode: str = "deepseek"
@@ -69,6 +73,7 @@ class Config:
     codex_timeout: int = 300
 
     # ---------- 视频 ----------
+    auto_video: bool = True
     video_speed: float = 1.5
     heartbeat_interval: int = 15
     max_concurrent_videos: int = 2
@@ -112,6 +117,11 @@ class Config:
         return bool(self.session_id)
 
     @property
+    def effective_university_id(self) -> str:
+        """Keep the authenticated school when its manual input is cleared."""
+        return self.university_id or (self.session_university_id if self.has_credentials else "")
+
+    @property
     def has_codex(self) -> bool:
         """是否能找到 Codex CLI（登录状态由实际调用检查）。"""
         return bool(shutil.which(self.codex_cli))
@@ -147,7 +157,7 @@ class Config:
         env_path = Path(env_file) if env_file else PROJECT_ROOT / ".env"
         if env_path.exists():
             load_dotenv(env_path, override=False)
-        else:
+        elif not getattr(sys, "frozen", False):
             load_dotenv(override=False)
 
         cfg = cls(
@@ -155,6 +165,7 @@ class Config:
             university_id=os.getenv("UNIVERSITY_ID", "").strip(),
             csrf_token=os.getenv("CSRF_TOKEN", "").strip(),
             session_id=os.getenv("SESSION_ID", "").strip(),
+            session_university_id=os.getenv("SESSION_UNIVERSITY_ID", "").strip(),
             ai_mode=os.getenv("AI_MODE", "deepseek").strip().lower(),
             deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", "").strip(),
             deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip(),
@@ -164,6 +175,7 @@ class Config:
             codex_cli=os.getenv("CODEX_CLI", "codex").strip() or "codex",
             codex_model=os.getenv("CODEX_MODEL", "").strip(),
             codex_timeout=max(1, _as_int(os.getenv("CODEX_TIMEOUT"), 300)),
+            auto_video=_as_bool(os.getenv("AUTO_VIDEO"), True),
             video_speed=_as_float(os.getenv("VIDEO_SPEED"), 1.5),
             heartbeat_interval=_as_int(os.getenv("HEARTBEAT_INTERVAL"), 15),
             max_concurrent_videos=_as_int(os.getenv("MAX_CONCURRENT_VIDEOS"), 2),
@@ -190,8 +202,8 @@ class Config:
             cookies["csrftoken"] = self.csrf_token
         if self.session_id:
             cookies["sessionid"] = self.session_id
-        if self.university_id:
-            cookies["university_id"] = self.university_id
+        if self.effective_university_id:
+            cookies["university_id"] = self.effective_university_id
         cookies.setdefault("platform_id", "3")
         cookies.setdefault("platform_type", "1")
         cookies.setdefault("xtbz", "ykt")
@@ -202,8 +214,8 @@ class Config:
         problems = []
         if not self.domain:
             problems.append("YUKETANG_DOMAIN 未配置")
-        if not self.university_id:
-            problems.append("UNIVERSITY_ID 未配置（可扫码登录后自动获取）")
+        if not self.effective_university_id:
+            problems.append("UNIVERSITY_ID 未配置（请从浏览器 Cookie 中获取并手动填写）")
         if not self.has_credentials:
             problems.append("SESSION_ID 未配置（将尝试扫码登录）")
         problems.extend(self.ai_problems())

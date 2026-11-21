@@ -88,6 +88,11 @@ class FontDecryptor:
     def loaded(self) -> bool:
         return self._loaded
 
+    def clear(self) -> None:
+        """Discard only the current exercise mapping, retaining reference font caches."""
+        self.char_map.clear()
+        self._loaded = False
+
     # ------------------------------------------------------------------
     def load_from_css(self, css_text: str) -> bool:
         """从 CSS 文本中提取字体 URL 并加载。"""

@@ -5,7 +5,7 @@
 1. **扫码登录**：通过雨课堂 WebSocket 获取微信登录二维码，扫码后换取 Cookie。
 2. **Cookie 登录**：直接使用 ``.env`` 中配置的 ``sessionid`` / ``csrftoken``。
 
-登录成功后会自动获取 ``user_id`` 与 ``university_id``。
+学校 ID 需手动配置；登录成功后同步 ``user_id``。
 """
 
 from __future__ import annotations
@@ -37,17 +37,23 @@ class LoginError(Exception):
 class QrcodeLogin:
     """通过 WebSocket 获取微信登录二维码并等待扫码。"""
 
-    def __init__(self, domain: str, timeout: int = 180) -> None:
+    def __init__(self, domain: str, timeout: int = 180, callback=None, stop_event=None) -> None:
         self.domain = domain
         self.timeout = timeout
         self.login_message: str = ""
         self._ws = None
         self._timer: Optional[threading.Timer] = None
         self._done = threading.Event()
+        self.callback = callback
+        self.stop_event = stop_event or threading.Event()
+        self.error_message = ""
 
     # ------------------------------------------------------------------
     def _print_qrcode(self, qr_data: str) -> None:
         """生成二维码图片并尝试用系统查看器打开。"""
+        if self.callback:
+            self.callback(qr_data)
+            return
         try:
             import qrcode
         except ImportError:
@@ -86,6 +92,9 @@ class QrcodeLogin:
 
     # ------------------------------------------------------------------
     def _on_message(self, _ws, message: str) -> None:
+        if self.stop_event.is_set():
+            self._close()
+            return
         try:
             msg = json.loads(message)
         except (json.JSONDecodeError, ValueError):
@@ -103,12 +112,26 @@ class QrcodeLogin:
             self._close()
 
     def _on_error(self, _ws, error) -> None:
-        logger.debug("WebSocket 错误：%s", error)
+        import ssl
+        from websocket import WebSocketTimeoutException
+        status = getattr(error, "status_code", None)
+        if isinstance(error, ssl.SSLError):
+            self.error_message = "登录连接的证书校验失败，请检查系统时间和网络代理"
+        elif status:
+            self.error_message = f"登录连接被拒绝（HTTP {status}），请检查雨课堂站点和网络"
+        elif isinstance(error, (TimeoutError, WebSocketTimeoutException)):
+            self.error_message = "登录连接超时，请检查网络后重试"
+        else:
+            self.error_message = "无法连接扫码登录服务，请检查雨课堂站点和网络代理"
+        logger.debug("WebSocket 连接异常：%s", type(error).__name__)
 
     def _on_close(self, _ws, _code, _msg) -> None:
         self._done.set()
 
     def _on_open(self, _ws) -> None:
+        if self.stop_event.is_set():
+            self._close()
+            return
         logger.debug("WebSocket 已连接")
         self._fetch_qrcode()
         self._timer = threading.Timer(60, self._fetch_qrcode)
@@ -159,15 +182,27 @@ class QrcodeLogin:
         )
         self._ws.on_open = self._on_open
 
-        thread = threading.Thread(target=self._ws.run_forever, daemon=True)
+        def connect():
+            try:
+                self._ws.run_forever(origin=f"https://{self.domain}")
+            except Exception as exc:
+                self._on_error(self._ws, exc)
+            finally:
+                self._done.set()
+
+        thread = threading.Thread(target=connect, daemon=True)
         thread.start()
 
-        if not self._done.wait(timeout=self.timeout):
-            self._close()
-            raise LoginError("扫码登录超时，请重新运行")
+        deadline = time.monotonic() + self.timeout
+        while not self._done.wait(0.2):
+            if self.stop_event.is_set() or time.monotonic() >= deadline:
+                self._close()
+                raise LoginError("登录已取消" if self.stop_event.is_set() else "扫码登录超时，请重试")
 
+        if self.stop_event.is_set():
+            raise LoginError("登录已取消")
         if not self.login_message:
-            raise LoginError("登录未成功（连接被关闭）")
+            raise LoginError(self.error_message or "扫码登录连接已关闭，请重新获取二维码")
         return self.login_message
 
 
@@ -177,8 +212,10 @@ class QrcodeLogin:
 class LoginManager:
     """统一登录入口。"""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, qrcode_callback=None, stop_event=None) -> None:
         self.config = config
+        self.qrcode_callback = qrcode_callback
+        self.stop_event = stop_event
 
     # ------------------------------------------------------------------
     def login(self, force_qrcode: bool = False) -> YuketangSession:
@@ -199,22 +236,28 @@ class LoginManager:
 
     # ------------------------------------------------------------------
     def _build_session(self, cookies: Dict[str, str]) -> YuketangSession:
-        return YuketangSession(
+        session = YuketangSession(
             domain=self.config.domain,
             cookies=cookies,
-            university_id=self.config.university_id,
+            university_id=self.config.effective_university_id,
             csrf_token=self.config.csrf_token,
             max_retries=self.config.max_retries,
         )
+        if self.stop_event is not None:
+            session.stop_event = self.stop_event
+        return session
 
     # ------------------------------------------------------------------
     def _qrcode_login(self) -> YuketangSession:
         """扫码登录流程。"""
-        university_id = self.config.university_id or self._fetch_university_id()
+        university_id = self.config.effective_university_id
         if not university_id:
-            raise LoginError("无法获取 university_id，请在 .env 中手动配置")
+            raise LoginError("请先在设置 → 连接中手动填写学校 ID，再扫码登录")
 
-        login_message = QrcodeLogin(self.config.domain).run()
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise LoginError("登录已取消")
+        login_message = QrcodeLogin(self.config.domain, callback=self.qrcode_callback,
+                                   stop_event=self.stop_event).run()
         message = json.loads(login_message)
         auth_info = message.get("Auth")
         user_id = message.get("UserID")
@@ -247,14 +290,19 @@ class LoginManager:
         }
         payload = {"auth": auth_info, "origin_user_id": str(user_id)}
 
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise LoginError("登录已取消")
+
         import requests
 
         try:
             resp = requests.post(
                 verify_url, json=payload, headers=headers, timeout=15
             )
-        except requests.exceptions.RequestException as exc:
-            raise LoginError(f"换取 Cookie 失败：{exc}") from exc
+        except requests.exceptions.RequestException:
+            raise LoginError("登录验证连接失败，请检查网络后重试") from None
+        if resp.status_code != 200:
+            raise LoginError(f"登录验证失败（HTTP {resp.status_code}），请检查学校 ID 后重试")
 
         set_cookie = resp.headers.get("Set-Cookie", "")
         cookies = self._parse_set_cookie(set_cookie)
@@ -297,26 +345,6 @@ class LoginManager:
         return cookies
 
     # ------------------------------------------------------------------
-    def _fetch_university_id(self) -> str:
-        """从站点接口获取 university_id。"""
-        import requests
-
-        url = (
-            f"{self.config.base_url}/edu_admin/get_custom_university_info/"
-            f"?current=1&_={int(time.time() * 1000)}"
-        )
-        try:
-            resp = requests.get(url, timeout=10)
-            data = resp.json().get("data", {})
-            uid = data.get("university_id")
-            if uid:
-                logger.debug("自动获取 university_id=%s", uid)
-                return str(uid)
-        except Exception as exc:  # pragma: no cover
-            logger.debug("获取 university_id 失败：%s", exc)
-        return ""
-
-    # ------------------------------------------------------------------
     def _verify(self, session: YuketangSession) -> bool:
         """校验会话是否有效，并同步 user_id。"""
         data = session.get_json(f"{session.base_url}/edu_admin/check_user_session/")
@@ -327,25 +355,30 @@ class LoginManager:
         match = re.search(r'"user_id"\s*:\s*"?(\d+)"?', text)
         if match:
             self.config.user_id = match.group(1)
+            session.user_id = match.group(1)
             session.headers["User-Id"] = match.group(1)
+            self.config.session_university_id = session.university_id
             return True
         # 部分部署返回 success 字段
-        return bool(data.get("success") or data.get("data"))
+        verified = bool(data.get("success") or data.get("data"))
+        if verified:
+            self.config.session_university_id = session.university_id
+        return verified
 
     # ------------------------------------------------------------------
     def _save_cookies(self, cookies: Dict[str, str]) -> None:
         """将登录 Cookie 写回 ``.env``，方便下次直接复用。"""
         from pathlib import Path
 
-        env_file = Path(__file__).resolve().parent.parent / ".env"
-        if not env_file.exists():
-            return
+        env_file = self.config.project_root / ".env"
         try:
-            lines = env_file.read_text(encoding="utf-8").splitlines()
+            env_file.parent.mkdir(parents=True, exist_ok=True)
+            lines = env_file.read_text(encoding="utf-8").splitlines() if env_file.exists() else []
             mapping = {
                 "SESSION_ID": cookies.get("sessionid", ""),
                 "CSRF_TOKEN": cookies.get("csrftoken", ""),
                 "UNIVERSITY_ID": cookies.get("university_id", ""),
+                "SESSION_UNIVERSITY_ID": self.config.session_university_id,
             }
             updated = []
             seen = set()
